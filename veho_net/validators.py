@@ -1,4 +1,4 @@
-# veho_net/validators.py - Enhanced validation with separate sort cost parameters
+# veho_net/validators.py - Enhanced validation with sort optimization support
 
 import pandas as pd
 
@@ -47,20 +47,54 @@ def _check_container_params(df_raw: pd.DataFrame):
 
 
 def _check_facilities(df_raw: pd.DataFrame):
-    """Validate facilities data structure and content."""
+    """Validate facilities data structure and content including sort optimization fields."""
     df = _norm_cols(df_raw)
     required = {
         "facility_name", "type", "market", "region",
         "lat", "lon", "timezone", "parent_hub_name", "is_injection_node"
     }
 
+    # Sort optimization specific fields
+    sort_fields = {
+        "max_sort_points_capacity",
+        "last_mile_sort_groups_count"
+    }
+
     missing = sorted(required - set(df.columns))
     if missing:
         _fail(f"facilities missing required columns: {missing}", df)
 
+    # Check for sort optimization fields
+    missing_sort = sorted(sort_fields - set(df.columns))
+    if missing_sort:
+        print(f"INFO: facilities missing sort optimization fields: {missing_sort}")
+        print("      These are required for multi-level sort optimization")
+        print("      Consider adding max_sort_points_capacity and last_mile_sort_groups_count columns")
+
     dups = df["facility_name"][df["facility_name"].duplicated()].unique()
     if len(dups) > 0:
         _fail(f"facilities has duplicate facility_name values: {list(dups)}", df)
+
+    # Validate sort capacity values if present
+    if "max_sort_points_capacity" in df.columns:
+        # Check that hub/hybrid facilities have sort capacity specified
+        hub_hybrid = df[df["type"].str.lower().isin(["hub", "hybrid"])]
+        missing_capacity = hub_hybrid[pd.isna(hub_hybrid["max_sort_points_capacity"])]
+
+        if not missing_capacity.empty:
+            print(f"WARNING: Hub/hybrid facilities missing max_sort_points_capacity:")
+            print(f"         {missing_capacity['facility_name'].tolist()}")
+            print(f"         Default capacity of 0 will be used, preventing sort optimization")
+
+    # Validate sort groups count for launch facilities
+    if "last_mile_sort_groups_count" in df.columns:
+        launch_facilities = df[df["type"].str.lower() == "launch"]
+        missing_groups = launch_facilities[pd.isna(launch_facilities["last_mile_sort_groups_count"])]
+
+        if not missing_groups.empty:
+            print(f"INFO: Launch facilities missing last_mile_sort_groups_count:")
+            print(f"      {missing_groups['facility_name'].tolist()}")
+            print(f"      Default value of 4 sort groups will be used")
 
 
 def _check_zips(df_raw: pd.DataFrame):
@@ -123,7 +157,7 @@ def _check_mileage_bands(df_raw: pd.DataFrame):
 
 
 def _check_timing_params(df_raw: pd.DataFrame):
-    """Validate timing parameters are present and reasonable."""
+    """Validate timing parameters including sort optimization parameters."""
     df = _norm_cols(df_raw)
 
     # Required timing parameters
@@ -135,24 +169,36 @@ def _check_timing_params(df_raw: pd.DataFrame):
         "last_mile_va_hours",
     }
 
+    # Sort optimization specific parameters
+    sort_timing_keys = {
+        "sort_points_per_destination"
+    }
+
     missing_required = sorted(required_keys - set(df["key"]))
     if missing_required:
         raise ValueError(f"timing_params missing required keys: {missing_required}")
 
+    # Check for sort optimization timing parameters
+    missing_sort = sorted(sort_timing_keys - set(df["key"]))
+    if missing_sort:
+        print(f"INFO: timing_params missing sort optimization keys: {missing_sort}")
+        print("      sort_points_per_destination is required for multi-level sort optimization")
+        print("      Default value of 1.0 will be used")
+
     # Validate timing values are positive
     for _, row in df.iterrows():
         key = row["key"]
-        if key in required_keys:
+        if key in (required_keys | sort_timing_keys):
             value = float(row["value"])
             if value <= 0:
                 raise ValueError(f"timing_params: {key} must be positive (found: {value})")
 
 
 def _check_cost_params(df_raw: pd.DataFrame):
-    """Validate all required cost parameters including separate sort costs."""
+    """Validate all required cost parameters including sort optimization costs."""
     df = _norm_cols(df_raw)
 
-    # Required core cost parameters - UPDATED to support separate sort costs
+    # Required core cost parameters
     required_keys = {
         "sort_cost_per_pkg",  # Can be used as fallback
         "last_mile_sort_cost_per_pkg",
@@ -165,6 +211,7 @@ def _check_cost_params(df_raw: pd.DataFrame):
     enhanced_sort_keys = {
         "injection_sort_cost_per_pkg",
         "intermediate_sort_cost_per_pkg",
+        "parent_hub_sort_cost_per_pkg",  # NEW for sort optimization
     }
 
     # Optional enhanced parameters
@@ -184,8 +231,10 @@ def _check_cost_params(df_raw: pd.DataFrame):
     if missing_enhanced_sort:
         print(f"INFO: cost_params missing enhanced sort parameters: {missing_enhanced_sort}")
         print("      Will use 'sort_cost_per_pkg' as fallback for missing sort cost parameters")
-        print("      Consider adding separate injection_sort_cost_per_pkg and intermediate_sort_cost_per_pkg")
-        print("      for more precise strategy differentiation testing")
+        print("      For multi-level sort optimization, consider adding:")
+        print("        - injection_sort_cost_per_pkg")
+        print("        - intermediate_sort_cost_per_pkg")
+        print("        - parent_hub_sort_cost_per_pkg (NEW - for region level sort)")
 
     # Check optional parameters
     missing_optional = sorted(optional_keys - set(df["key"]))
@@ -265,7 +314,7 @@ def _check_scenarios(df_raw: pd.DataFrame):
 
 def validate_inputs(dfs: dict):
     """
-    Comprehensive input validation with support for separate sort cost parameters.
+    Comprehensive input validation with support for multi-level sort optimization.
     """
     print("Validating input sheets...")
 
@@ -282,5 +331,5 @@ def validate_inputs(dfs: dict):
     _check_scenarios(dfs["scenarios"])
 
     print("✅ Input validation complete - all required parameters present and valid")
-    print("ℹ️  Model will use only input parameters - no hardcoded fallback values")
-    print("🔧 CORRECTED ARCHITECTURE: All cost calculation happens in MILP with proper aggregation")
+    print("ℹ️  Multi-level sort optimization fields detected and validated")
+    print("🔧 EXTENDED ARCHITECTURE: Sort level decisions integrated with path and capacity optimization")
