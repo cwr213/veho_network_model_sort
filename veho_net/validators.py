@@ -1,4 +1,4 @@
-# veho_net/validators.py - Enhanced validation with sort optimization support
+# veho_net/validators.py - Enhanced validation with regional_sort_hub support
 
 import pandas as pd
 
@@ -60,6 +60,9 @@ def _check_facilities(df_raw: pd.DataFrame):
         "last_mile_sort_groups_count"
     }
 
+    # Regional sorting field (optional)
+    regional_sort_field = "regional_sort_hub"
+
     missing = sorted(required - set(df.columns))
     if missing:
         _fail(f"facilities missing required columns: {missing}", df)
@@ -70,6 +73,20 @@ def _check_facilities(df_raw: pd.DataFrame):
         print(f"INFO: facilities missing sort optimization fields: {missing_sort}")
         print("      These are required for multi-level sort optimization")
         print("      Consider adding max_sort_points_capacity and last_mile_sort_groups_count columns")
+
+    # Check for regional sort hub field
+    if regional_sort_field not in df.columns:
+        print(f"INFO: facilities missing '{regional_sort_field}' column")
+        print("      Will use 'parent_hub_name' for sorting decisions")
+        print("      Add 'regional_sort_hub' column for separate routing vs. sorting hierarchies")
+    else:
+        print(f"✓ Found '{regional_sort_field}' column - will use for sorting decisions")
+
+        # Validate regional_sort_hub values
+        missing_regional = df[pd.isna(df[regional_sort_field]) | (df[regional_sort_field] == "")]
+        if not missing_regional.empty:
+            print(f"WARNING: {len(missing_regional)} facilities missing regional_sort_hub values:")
+            print(f"         Will fall back to parent_hub_name for these facilities")
 
     dups = df["facility_name"][df["facility_name"].duplicated()].unique()
     if len(dups) > 0:
@@ -211,7 +228,7 @@ def _check_cost_params(df_raw: pd.DataFrame):
     enhanced_sort_keys = {
         "injection_sort_cost_per_pkg",
         "intermediate_sort_cost_per_pkg",
-        "parent_hub_sort_cost_per_pkg",  # NEW for sort optimization
+        "parent_hub_sort_cost_per_pkg",  # For region level sort
     }
 
     # Optional enhanced parameters
@@ -234,7 +251,7 @@ def _check_cost_params(df_raw: pd.DataFrame):
         print("      For multi-level sort optimization, consider adding:")
         print("        - injection_sort_cost_per_pkg")
         print("        - intermediate_sort_cost_per_pkg")
-        print("        - parent_hub_sort_cost_per_pkg (NEW - for region level sort)")
+        print("        - parent_hub_sort_cost_per_pkg (for region level sort)")
 
     # Check optional parameters
     missing_optional = sorted(optional_keys - set(df["key"]))
@@ -314,7 +331,7 @@ def _check_scenarios(df_raw: pd.DataFrame):
 
 def validate_inputs(dfs: dict):
     """
-    Comprehensive input validation with support for multi-level sort optimization.
+    Comprehensive input validation with support for multi-level sort optimization and regional_sort_hub.
     """
     print("Validating input sheets...")
 
@@ -332,4 +349,4 @@ def validate_inputs(dfs: dict):
 
     print("✅ Input validation complete - all required parameters present and valid")
     print("ℹ️  Multi-level sort optimization fields detected and validated")
-    print("🔧 EXTENDED ARCHITECTURE: Sort level decisions integrated with path and capacity optimization")
+    print("🔧 UPDATED ARCHITECTURE: Regional sorting hierarchy separate from routing hierarchy")

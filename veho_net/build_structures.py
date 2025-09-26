@@ -1,4 +1,4 @@
-# veho_net/build_structures.py - CORRECTED: Use input parameters only, no hardcoded values
+# veho_net/build_structures.py - CORRECTED: Include self-destinations for hybrid facilities
 import pandas as pd
 import numpy as np
 from .geo import haversine_miles
@@ -11,8 +11,9 @@ def build_od_and_direct(
         injection_distribution: pd.DataFrame,
 ):
     """
-    Enhanced OD generation ensuring only hub/hybrid facilities can originate middle-mile flows.
+    CORRECTED: Enhanced OD generation including self-destinations for hybrid facilities.
     Launch facilities only receive direct injection, never send outbound flows.
+    Hybrid facilities can inject to themselves (for their own last-mile delivery).
     """
     # Schema validation
     req_fac = {"facility_name", "type", "lat", "lon", "parent_hub_name", "is_injection_node"}
@@ -105,8 +106,29 @@ def build_od_and_direct(
     od["pkgs_offpeak_day"] = annual_total * off_pct * mm_off * od["inj_share"] * od["dest_pop_share"]
     od["pkgs_peak_day"] = annual_total * peak_pct * mm_peak * od["inj_share"] * od["dest_pop_share"]
 
-    # Remove O==D pairs (handled by direct injection)
-    od = od[od["origin"] != od["dest"]].reset_index(drop=True)
+    # CORRECTED: Only remove O==D pairs for pure hub facilities, keep them for hybrid facilities
+    fac_types = fac.set_index("facility_name")["type"].to_dict()
+
+    # Filter O==D pairs based on facility type
+    od_filtered = []
+    for _, row in od.iterrows():
+        origin = row["origin"]
+        dest = row["dest"]
+
+        if origin == dest:
+            # Keep self-destination if origin is hybrid (has last-mile delivery)
+            origin_type = fac_types.get(origin, "").lower()
+            if origin_type == "hybrid":
+                od_filtered.append(row)
+            # Remove self-destination for pure hub facilities
+            # (hub facilities don't do last-mile delivery, so no self-destination needed)
+        else:
+            # Keep all different O-D pairs
+            od_filtered.append(row)
+
+    od = pd.DataFrame(od_filtered).reset_index(drop=True)
+
+    print(f"    Generated {len(od)} middle-mile OD pairs (including hybrid self-destinations)")
 
     return od, direct, pop_by_dest
 

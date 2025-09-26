@@ -1,4 +1,4 @@
-# veho_net/sort_optimization.py - Multi-level sortation optimization logic
+# veho_net/sort_optimization.py - Updated to use regional_sort_hub for sorting decisions
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Set
@@ -7,28 +7,44 @@ from collections import defaultdict
 
 def build_facility_relationships(facilities: pd.DataFrame) -> Dict[str, Dict]:
     """
-    Build facility relationship mapping including parent hub hierarchies.
+    Build facility relationship mapping with separate routing vs. sorting hierarchies.
 
     Returns:
         Dict with facility relationships and classification info
     """
     relationships = {}
 
-    # Build parent hub mapping
+    # Build parent hub mapping (for routing/paths)
     parent_hub_map = {}
+    # Build regional sort hub mapping (for sorting decisions)
+    regional_sort_hub_map = {}
     facility_types = {}
     launch_facilities = set()
     hub_facilities = set()
+
+    # Check if regional_sort_hub column exists, fallback to parent_hub_name
+    has_regional_sort_hub = 'regional_sort_hub' in facilities.columns
 
     for _, row in facilities.iterrows():
         facility_name = row['facility_name']
         facility_type = str(row['type']).lower()
         parent_hub = row.get('parent_hub_name', facility_name)
 
+        # Use regional_sort_hub if available, otherwise fallback to parent_hub_name
+        if has_regional_sort_hub:
+            regional_sort_hub = row.get('regional_sort_hub', parent_hub)
+            if pd.isna(regional_sort_hub) or regional_sort_hub == "":
+                regional_sort_hub = parent_hub
+        else:
+            regional_sort_hub = parent_hub
+
         if pd.isna(parent_hub) or parent_hub == "":
             parent_hub = facility_name
+        if pd.isna(regional_sort_hub) or regional_sort_hub == "":
+            regional_sort_hub = facility_name
 
         parent_hub_map[facility_name] = parent_hub
+        regional_sort_hub_map[facility_name] = regional_sort_hub
         facility_types[facility_name] = facility_type
 
         if facility_type == 'launch':
@@ -37,10 +53,12 @@ def build_facility_relationships(facilities: pd.DataFrame) -> Dict[str, Dict]:
             hub_facilities.add(facility_name)
 
     relationships = {
-        'parent_hub_map': parent_hub_map,
+        'parent_hub_map': parent_hub_map,  # Used for routing/paths
+        'regional_sort_hub_map': regional_sort_hub_map,  # Used for sorting
         'facility_types': facility_types,
         'launch_facilities': launch_facilities,
-        'hub_facilities': hub_facilities
+        'hub_facilities': hub_facilities,
+        'has_regional_sort_hub': has_regional_sort_hub
     }
 
     return relationships
@@ -50,6 +68,7 @@ def calculate_sort_point_requirements(od_data: pd.DataFrame, facilities: pd.Data
                                       timing_kv: Dict, sort_level: str) -> Dict[str, Dict]:
     """
     Calculate sort point requirements for each facility based on sort level choice.
+    Uses regional_sort_hub for sorting hierarchy.
 
     Args:
         od_data: OD pairs with volume
@@ -61,7 +80,7 @@ def calculate_sort_point_requirements(od_data: pd.DataFrame, facilities: pd.Data
         Dict[facility_name, Dict[destination_key, sort_points_needed]]
     """
     relationships = build_facility_relationships(facilities)
-    parent_hub_map = relationships['parent_hub_map']
+    regional_sort_hub_map = relationships['regional_sort_hub_map']
 
     sort_points_per_dest = float(timing_kv.get('sort_points_per_destination', 1.0))
     facility_requirements = defaultdict(lambda: defaultdict(float))
@@ -79,8 +98,8 @@ def calculate_sort_point_requirements(od_data: pd.DataFrame, facilities: pd.Data
 
         # Determine destination key and sort points based on sort level
         if sort_level == 'region':
-            # Sort to destination parent hub (region)
-            dest_key = parent_hub_map[dest]
+            # Sort to destination regional sort hub (region)
+            dest_key = regional_sort_hub_map[dest]
             sort_points = sort_points_per_dest
 
         elif sort_level == 'market':
@@ -107,12 +126,13 @@ def calculate_sort_point_requirements(od_data: pd.DataFrame, facilities: pd.Data
 def aggregate_facility_volumes(od_selected: pd.DataFrame, facilities: pd.DataFrame) -> Dict[str, Dict]:
     """
     Aggregate volume flows by facility role (injection, intermediate, destination).
+    Uses regional_sort_hub for regional aggregation.
 
     Returns:
         Dict[facility_name, {injection_volume, intermediate_volume, destination_volume}]
     """
     relationships = build_facility_relationships(facilities)
-    parent_hub_map = relationships['parent_hub_map']
+    regional_sort_hub_map = relationships['regional_sort_hub_map']
 
     facility_volumes = defaultdict(lambda: {
         'injection_volume': 0.0,
@@ -160,12 +180,13 @@ def calculate_sort_level_costs(od_row: pd.Series, sort_level: str, cost_kv: Dict
                                facilities: pd.DataFrame) -> Dict[str, float]:
     """
     Calculate processing costs for an OD pair based on chosen sort level.
+    Uses regional_sort_hub for regional cost calculations.
 
     Returns:
         Dict with cost breakdown by component
     """
     relationships = build_facility_relationships(facilities)
-    parent_hub_map = relationships['parent_hub_map']
+    regional_sort_hub_map = relationships['regional_sort_hub_map']
 
     # Get cost parameters
     injection_sort_pp = float(cost_kv.get("injection_sort_cost_per_pkg",
@@ -189,7 +210,7 @@ def calculate_sort_level_costs(od_row: pd.Series, sort_level: str, cost_kv: Dict
         nodes = [origin, dest]
 
     intermediate_facilities = nodes[1:-1] if len(nodes) > 2 else []
-    dest_parent_hub = parent_hub_map[dest]
+    dest_regional_sort_hub = regional_sort_hub_map[dest]
 
     # Calculate costs based on sort level
     costs = {
@@ -204,8 +225,8 @@ def calculate_sort_level_costs(od_row: pd.Series, sort_level: str, cost_kv: Dict
     costs['intermediate_crossdock_cost'] = len(intermediate_facilities) * intermediate_crossdock_pp * volume
 
     if sort_level == 'region':
-        # Region level: parent hub sorts, last mile facility also sorts
-        if dest_parent_hub != dest and dest_parent_hub in nodes:
+        # Region level: regional sort hub sorts, last mile facility also sorts
+        if dest_regional_sort_hub != dest and dest_regional_sort_hub in nodes:
             costs['parent_hub_sort_cost'] = parent_hub_sort_pp * volume
         costs['last_mile_sort_cost'] = last_mile_sort_pp * volume
 
@@ -273,31 +294,32 @@ def validate_sort_capacity_constraints(sort_requirements: Dict, facilities: pd.D
 def get_sort_level_options(od_row: pd.Series, facilities: pd.DataFrame) -> List[str]:
     """
     Determine valid sort level options for an OD pair based on facility constraints.
+    Uses regional_sort_hub for regional sorting decisions.
 
     Returns:
         List of valid sort levels: ['region', 'market', 'sort_group']
     """
     relationships = build_facility_relationships(facilities)
-    parent_hub_map = relationships['parent_hub_map']
+    regional_sort_hub_map = relationships['regional_sort_hub_map']
     facility_types = relationships['facility_types']
 
     origin = od_row['origin']
     dest = od_row['dest']
-    dest_parent_hub = parent_hub_map[dest]
+    dest_regional_sort_hub = regional_sort_hub_map[dest]
 
     valid_options = []
 
     # Check if origin can perform sorting (must be hub/hybrid)
     if facility_types.get(origin) in ['hub', 'hybrid']:
 
-        # Region level: only valid if dest has parent hub different from itself
-        if dest_parent_hub != dest:
-            valid_options.append('region')
+        # Region level: always valid for hub/hybrid origins
+        # Creates region containers for destination's regional sort hub
+        valid_options.append('region')
 
         # Market level: always valid
         valid_options.append('market')
 
-        # Sort group level: valid if destination is launch facility with sort groups
+        # Sort group level: valid if destination is launch facility
         if facility_types.get(dest) == 'launch':
             valid_options.append('sort_group')
 
