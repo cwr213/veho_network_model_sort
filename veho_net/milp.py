@@ -72,6 +72,8 @@ def calculate_facility_sort_requirements(facility_name, groups, sort_decision, r
             child_facilities.add(child_name)
 
     # STEP 3: Calculate MINIMUM sort points needed (optimal region-level sorting)
+    # Note: This assumes optimal region-level for own region and external regions
+    # Sort group level would require MORE than this minimum
 
     # Own region destinations = children + self (if hybrid)
     own_region_count = len(child_facilities)
@@ -90,14 +92,17 @@ def calculate_facility_sort_requirements(facility_name, groups, sort_decision, r
     if facility_name in unique_regional_sort_hubs:
         external_regions_count -= 1
 
-    # Calculate minimum and maximum sort points needed
+    # Calculate theoretical minimum (assumes optimal region-level consolidation)
+    # and market-level sort points needed
     minimum_sort_points = (own_region_count + external_regions_count) * sort_points_per_dest
-    maximum_sort_points = len(injection_destinations) * sort_points_per_dest  # Market-level sorting
+    market_level_sort_points = len(injection_destinations) * sort_points_per_dest
+
+    # Note: Sort group level would require even more than market level due to multipliers
 
     return {
         'injection_destinations_count': len(injection_destinations),
         'minimum_sort_points': minimum_sort_points,
-        'maximum_sort_points': maximum_sort_points,
+        'market_level_sort_points': market_level_sort_points,
         'includes_self_destination': facility_name in injection_destinations,
         'child_facilities_count': len(child_facilities),
         'child_facilities': child_facilities,
@@ -272,29 +277,19 @@ def solve_arc_pooled_path_selection_with_sort_optimization(
         # Create sort point usage variable
         facility_sort_points[facility_name] = model.NewIntVar(0, max_capacity, f"sort_points_{facility_name}")
 
-        # Build constraint terms with proper regional consolidation logic
+        # CORRECTED: Build constraint terms with proper sort group capacity accounting
         sort_point_terms = []
 
-        # UPDATED: Check feasibility first - model should fail if capacity < minimum needed
+        # Check feasibility first
         if max_capacity < requirements['minimum_sort_points']:
             print(
                 f"      ❌ INFEASIBLE: {facility_name} needs minimum {requirements['minimum_sort_points']} but only has {max_capacity}")
             print(f"         This facility cannot operate even with optimal region-level sorting")
             print(f"         Consider increasing max_sort_points_capacity for {facility_name}")
-            # Continue building constraints but model will likely fail
 
-        # FIXED: Implement proper regional consolidation constraints
         if requirements['injection_destinations_count'] > 0:
 
-            # Group destinations by their regional sort hub
-            destinations_by_regional_hub = {}
-            for dest in requirements['injection_destinations']:
-                dest_regional_sort_hub = relationships['regional_sort_hub_map'].get(dest, dest)
-                if dest_regional_sort_hub not in destinations_by_regional_hub:
-                    destinations_by_regional_hub[dest_regional_sort_hub] = []
-                destinations_by_regional_hub[dest_regional_sort_hub].append(dest)
-
-            # Create destination-level sort decision variables (for linking to OD decisions)
+            # Create destination-level sort decision variables
             dest_sort_decisions = {}
             for dest in requirements['injection_destinations']:
                 dest_sort_decisions[dest] = {}
@@ -334,75 +329,81 @@ def solve_arc_pooled_path_selection_with_sort_optimization(
                         if od_sort_vars[sort_level] is not None and dest_sort_vars[sort_level] is not None:
                             model.Add(od_sort_vars[sort_level] == dest_sort_vars[sort_level])
 
-            # FIXED: Regional consolidation logic - this is the key fix
+            # STEP 1: Handle SORT GROUP level destinations individually (highest capacity requirement)
+            for dest in requirements['injection_destinations']:
+                if dest_sort_decisions[dest]['sort_group'] is not None:
+                    if dest in facility_lookup.index:
+                        sort_groups_count = facility_lookup.at[dest, 'last_mile_sort_groups_count']
+                        if pd.isna(sort_groups_count) or sort_groups_count <= 0:
+                            sort_groups_count = 4  # Default fallback
+                        else:
+                            sort_groups_count = int(sort_groups_count)
+
+                        # Sort group level: multiplied sort points per destination
+                        sort_group_points = int(sort_points_per_dest * sort_groups_count)
+                        sort_point_terms.append(dest_sort_decisions[dest]['sort_group'] * sort_group_points)
+
+            # STEP 2: Handle REGION/MARKET level destinations with regional consolidation
+            # Group destinations by regional sort hub (excluding sort_group destinations)
+            destinations_by_regional_hub = {}
+            for dest in requirements['injection_destinations']:
+                dest_regional_sort_hub = relationships['regional_sort_hub_map'].get(dest, dest)
+                if dest_regional_sort_hub not in destinations_by_regional_hub:
+                    destinations_by_regional_hub[dest_regional_sort_hub] = []
+                destinations_by_regional_hub[dest_regional_sort_hub].append(dest)
+
+            # Apply regional consolidation logic to region/market destinations only
             for regional_hub, destinations_in_hub in destinations_by_regional_hub.items():
 
                 if regional_hub == facility_name:
-                    # OWN REGION: Can consolidate multiple destinations into fewer sort points
+                    # OWN REGION: Can use regional consolidation for capacity relief
 
-                    # Check if ALL destinations in own region use region-level sorting
-                    all_region_level = model.NewBoolVar(f"all_region_{facility_name}")
-
-                    region_terms = []
-                    market_terms = []
-                    sort_group_terms = []
+                    # Separate region vs market destinations in own region
+                    own_region_region_terms = []
+                    own_region_market_terms = []
 
                     for dest in destinations_in_hub:
                         if dest_sort_decisions[dest]['region'] is not None:
-                            region_terms.append(dest_sort_decisions[dest]['region'])
+                            own_region_region_terms.append(dest_sort_decisions[dest]['region'])
                         if dest_sort_decisions[dest]['market'] is not None:
-                            market_terms.append(dest_sort_decisions[dest]['market'])
-                        if dest_sort_decisions[dest]['sort_group'] is not None:
-                            sort_group_terms.append(dest_sort_decisions[dest]['sort_group'])
+                            own_region_market_terms.append(dest_sort_decisions[dest]['market'])
 
-                    # all_region_level = 1 if ALL destinations use region-level sorting
-                    if region_terms:
-                        model.Add(all_region_level * len(region_terms) <= sum(region_terms))
-                        model.Add(all_region_level >= sum(region_terms) - len(region_terms) + 1)
-                    else:
-                        model.Add(all_region_level == 0)
+                    # If ANY destination in own region uses region-level, consolidate to 1 sort point
+                    if own_region_region_terms:
+                        any_region_level = model.NewBoolVar(f"any_region_{facility_name}")
 
-                    # Sort points calculation for own region:
-                    # - If all destinations use region level: 1 sort point total
-                    # - Otherwise: 1 sort point per destination (market/sort_group level)
+                        # any_region_level = 1 if ANY destination uses region-level sorting
+                        model.Add(any_region_level <= sum(own_region_region_terms))
+                        for term in own_region_region_terms:
+                            model.Add(any_region_level >= term)
 
-                    # Market level sort points (when not all region-level)
-                    if market_terms:
-                        market_sort_points = sum(market_terms) * int(sort_points_per_dest)
-                        sort_point_terms.append(market_sort_points)
+                        # Regional consolidation: 1 sort point for entire own region when region-level used
+                        sort_point_terms.append(any_region_level * int(sort_points_per_dest))
 
-                    # Sort group level sort points
-                    for dest in destinations_in_hub:
-                        if dest_sort_decisions[dest]['sort_group'] is not None:
-                            if dest in facility_lookup.index:
-                                sort_groups_count = facility_lookup.at[dest, 'last_mile_sort_groups_count']
-                                if not pd.isna(sort_groups_count):
-                                    sort_group_points = int(sort_points_per_dest * sort_groups_count)
-                                    sort_point_terms.append(dest_sort_decisions[dest]['sort_group'] * sort_group_points)
-
-                    # Region level consolidation: only 1 sort point when ALL destinations use region-level
-                    if region_terms:
-                        regional_consolidation_points = all_region_level * int(sort_points_per_dest)
-                        sort_point_terms.append(regional_consolidation_points)
+                    # Market level destinations in own region: individual sort points
+                    if own_region_market_terms:
+                        for market_term in own_region_market_terms:
+                            sort_point_terms.append(market_term * int(sort_points_per_dest))
 
                 else:
-                    # EXTERNAL REGION: Always 1 sort point per regional hub (regardless of sort level)
+                    # EXTERNAL REGION: Always 1 sort point per regional hub
                     external_region_active = model.NewBoolVar(f"external_region_{facility_name}_{regional_hub}")
 
-                    # External region active if ANY destination in this region is served
+                    # Active if ANY destination in this external region is served (region or market level)
                     external_terms = []
                     for dest in destinations_in_hub:
-                        for sort_level in ['region', 'market', 'sort_group']:
-                            if dest_sort_decisions[dest][sort_level] is not None:
-                                external_terms.append(dest_sort_decisions[dest][sort_level])
+                        if dest_sort_decisions[dest]['region'] is not None:
+                            external_terms.append(dest_sort_decisions[dest]['region'])
+                        if dest_sort_decisions[dest]['market'] is not None:
+                            external_terms.append(dest_sort_decisions[dest]['market'])
 
                     if external_terms:
-                        # Big M constraint: external_region_active = 1 if any destination is served
+                        # External region active if any destination served
                         model.Add(external_region_active <= sum(external_terms))
                         for term in external_terms:
                             model.Add(external_region_active >= term)
 
-                        # Always 1 sort point per external regional hub
+                        # 1 sort point per external regional hub
                         sort_point_terms.append(external_region_active * int(sort_points_per_dest))
 
         # Add capacity constraint
@@ -426,22 +427,23 @@ def solve_arc_pooled_path_selection_with_sort_optimization(
         print(f"      Child facilities: {requirements['child_facilities_count']} (already counted in injection)")
 
         # DETAILED MINIMUM CALCULATION DEBUG
-        print(f"      --- Minimum Sort Points Calculation ---")
+        print(f"      --- Sort Points Analysis ---")
         print(f"      Own region destinations: {requirements['own_region_count']} (children + self if hybrid)")
         print(
             f"      External regions served: {requirements['external_regions_count']} (unique regional_sort_hubs - 1)")
         print(f"      Total unique regional sort hubs: {requirements['unique_regional_sort_hubs_count']}")
         print(f"      MINIMUM sort points needed: {requirements['minimum_sort_points']} (optimal region-level)")
-        print(f"      MAXIMUM sort points needed: {requirements['maximum_sort_points']} (all market-level)")
+        print(f"      MARKET LEVEL sort points needed: {requirements['market_level_sort_points']} (all market-level)")
+        print(f"      NOTE: Sort group level would require 4-8× market level due to sort group multipliers")
 
         # Capacity analysis
         min_deficit = max_capacity - requirements['minimum_sort_points']
-        max_deficit = max_capacity - requirements['maximum_sort_points']
+        market_deficit = max_capacity - requirements['market_level_sort_points']
 
         print(
             f"      Capacity vs MINIMUM: {min_deficit} ({'FEASIBLE' if min_deficit >= 0 else 'INFEASIBLE - will fail'})")
         print(
-            f"      Capacity vs MAXIMUM: {max_deficit} ({'SURPLUS' if max_deficit >= 0 else 'DEFICIT - forces region sorting'})")
+            f"      Capacity vs MARKET LEVEL: {market_deficit} ({'SURPLUS' if market_deficit >= 0 else 'DEFICIT - forces region sorting'})")
 
     print(f"    Created sort capacity constraints for {len(facility_sort_points)} facilities")
 
@@ -773,9 +775,9 @@ def solve_arc_pooled_path_selection_with_sort_optimization(
         total_ods = len(sort_summary)
 
         network_kpis.update({
-            'pct_region_sort': (sort_level_counts.get('region', 0) / total_ods) * 100,
-            'pct_market_sort': (sort_level_counts.get('market', 0) / total_ods) * 100,
-            'pct_sort_group_sort': (sort_level_counts.get('sort_group', 0) / total_ods) * 100,
+            'pct_region_sort': (sort_level_counts.get('region', 0) / total_ods),
+            'pct_market_sort': (sort_level_counts.get('market', 0) / total_ods),
+            'pct_sort_group_sort': (sort_level_counts.get('sort_group', 0) / total_ods),
             'total_sort_savings': sort_summary['savings_vs_market'].sum(),
             'baseline_total_cost': baseline_total_cost,
             'baseline_cost_per_pkg': baseline_cost_per_pkg,
@@ -783,7 +785,7 @@ def solve_arc_pooled_path_selection_with_sort_optimization(
             'optimized_total_cost': optimized_total_cost,
             'optimized_cost_per_pkg': optimized_cost_per_pkg,
             'constraint_cost_impact': constraint_cost_impact,
-            'constraint_cost_impact_pct': constraint_cost_impact_pct,
+            'constraint_cost_impact_pct': constraint_cost_impact_pct / 100,  # Convert to decimal
         })
 
     print(

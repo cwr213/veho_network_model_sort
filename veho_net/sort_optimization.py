@@ -293,41 +293,33 @@ def validate_sort_capacity_constraints(sort_requirements: Dict, facilities: pd.D
 
 def get_sort_level_options(od_row: pd.Series, facilities: pd.DataFrame) -> List[str]:
     """
-    Determine valid sort level options for an OD pair based on facility constraints.
-    Uses regional_sort_hub for regional sorting decisions.
+    CORRECTED: Determine valid sort level options for an OD pair based on facility constraints.
+
+    Business Rules:
+    - All middle-mile ODs (O≠D) have origins that are hub/hybrid (launch only does direct injection)
+    - Destinations can be launch or hybrid (pure hubs don't do delivery)
+    - All destinations can have sort groups (launch facilities AND hybrid facilities do delivery)
+    - Therefore: ALL middle-mile ODs should support region, market, and sort_group levels
 
     Returns:
         List of valid sort levels: ['region', 'market', 'sort_group']
     """
     relationships = build_facility_relationships(facilities)
-    regional_sort_hub_map = relationships['regional_sort_hub_map']
     facility_types = relationships['facility_types']
 
     origin = od_row['origin']
     dest = od_row['dest']
-    dest_regional_sort_hub = regional_sort_hub_map[dest]
 
-    valid_options = []
+    # For middle-mile ODs (O≠D), origin must be hub/hybrid and dest must be launch/hybrid
+    # All such ODs should support all three sort levels
 
-    # Check if origin can perform sorting (must be hub/hybrid)
-    if facility_types.get(origin) in ['hub', 'hybrid']:
-
-        # Region level: always valid for hub/hybrid origins
-        # Creates region containers for destination's regional sort hub
-        valid_options.append('region')
-
-        # Market level: always valid
-        valid_options.append('market')
-
-        # Sort group level: valid if destination is launch facility
-        if facility_types.get(dest) == 'launch':
-            valid_options.append('sort_group')
-
-    # If no valid options (shouldn't happen), default to market
-    if not valid_options:
-        valid_options = ['market']
-
-    return valid_options
+    if origin != dest:
+        # Middle-mile OD: should support all sort levels
+        return ['region', 'market', 'sort_group']
+    else:
+        # Self-destination (hybrid facility sorting for its own delivery)
+        # Should also support all sort levels
+        return ['region', 'market', 'sort_group']
 
 
 def calculate_sort_level_savings(od_row: pd.Series, cost_kv: Dict, facilities: pd.DataFrame) -> Dict[str, float]:
@@ -363,6 +355,9 @@ def build_sort_decision_summary(od_selected: pd.DataFrame, sort_decisions: Dict,
     Returns:
         DataFrame with sort decision analysis
     """
+    relationships = build_facility_relationships(facilities)
+    regional_sort_hub_map = relationships['regional_sort_hub_map']
+
     summary_data = []
 
     for _, od_row in od_selected.iterrows():
@@ -375,7 +370,9 @@ def build_sort_decision_summary(od_selected: pd.DataFrame, sort_decisions: Dict,
 
         summary_data.append({
             'origin': od_row['origin'],
+            'origin_regional_sort_hub': regional_sort_hub_map.get(od_row['origin'], od_row['origin']),
             'dest': od_row['dest'],
+            'dest_regional_sort_hub': regional_sort_hub_map.get(od_row['dest'], od_row['dest']),
             'pkgs_day': od_row.get('pkgs_day', 0),
             'chosen_sort_level': chosen_sort_level,
             'total_sort_cost': sum(costs.values()),
