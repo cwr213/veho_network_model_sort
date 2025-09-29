@@ -1,10 +1,10 @@
-# veho_net/milp.py - FIXED: Multi-level sortation optimization with proper minimum capacity logic
+# veho_net/milp_sort.py - FIXED: Multi-level sortation optimization with proper minimum capacity logic
 from ortools.sat.python import cp_model
 import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, List
-from .time_cost import weighted_pkg_cube, calculate_truck_capacity
-from .geo import haversine_miles, band_lookup
+from .time_cost_sort import weighted_pkg_cube, calculate_truck_capacity
+from .geo_sort import haversine_miles, band_lookup
 from .sort_optimization import (
     build_facility_relationships, calculate_sort_point_requirements,
     get_sort_level_options, calculate_sort_level_costs, validate_sort_capacity_constraints

@@ -1,7 +1,7 @@
-# veho_net/build_structures.py - CORRECTED: Include self-destinations for hybrid facilities
+# veho_net/build_structures_sort.py - CORRECTED: Include self-destinations for hybrid facilities
 import pandas as pd
 import numpy as np
-from .geo import haversine_miles
+from .geo_sort import haversine_miles
 
 
 def build_od_and_direct(

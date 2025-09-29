@@ -1,10 +1,10 @@
-# veho_net/time_cost.py - CORRECTED: Remove hardcoded values, use input parameters only
+# veho_net/time_cost_sort.py - CORRECTED: Remove hardcoded values, use input parameters only
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time
 import pytz
 from typing import Tuple, Dict, Optional, List, Tuple as Tup
-from .geo import haversine_miles, band_lookup
+from .geo_sort import haversine_miles, band_lookup
 
 
 def _parse_hhmm(val) -> time:

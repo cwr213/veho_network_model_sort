@@ -1,7 +1,7 @@
-# veho_net/reporting.py - COMPREHENSIVE FIX: Direct injection handling and accurate cost metrics
+# veho_net/reporting_sort.py - COMPREHENSIVE FIX: Direct injection handling and accurate cost metrics
 import pandas as pd
 import numpy as np
-from .geo import haversine_miles
+from .geo_sort import haversine_miles
 
 
 def _calculate_containers_needed(pkgs_day: float, package_mix: pd.DataFrame,
@@ -12,7 +12,7 @@ def _calculate_containers_needed(pkgs_day: float, package_mix: pd.DataFrame,
     Returns:
         Dict with container counts and cube metrics
     """
-    from .time_cost import weighted_pkg_cube
+    from .time_cost_sort import weighted_pkg_cube
 
     w_cube = weighted_pkg_cube(package_mix)
     total_cube = pkgs_day * w_cube
