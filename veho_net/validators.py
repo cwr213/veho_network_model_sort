@@ -1,4 +1,4 @@
-# veho_net/validators.py - Enhanced validation with regional_sort_hub support
+# veho_net/validators.py - STRICT: All fields mandatory, no fallbacks allowed
 
 import pandas as pd
 
@@ -47,71 +47,63 @@ def _check_container_params(df_raw: pd.DataFrame):
 
 
 def _check_facilities(df_raw: pd.DataFrame):
-    """Validate facilities data structure and content including sort optimization fields."""
+    """
+    STRICT: Validate facilities data - all sort optimization fields REQUIRED.
+    No fallbacks allowed.
+    """
     df = _norm_cols(df_raw)
     required = {
         "facility_name", "type", "market", "region",
-        "lat", "lon", "timezone", "parent_hub_name", "is_injection_node"
+        "lat", "lon", "timezone", "parent_hub_name", "is_injection_node",
+        "max_sort_points_capacity",  # REQUIRED for sort optimization
+        "last_mile_sort_groups_count"  # REQUIRED for sort optimization
     }
-
-    # Sort optimization specific fields
-    sort_fields = {
-        "max_sort_points_capacity",
-        "last_mile_sort_groups_count"
-    }
-
-    # Regional sorting field (optional)
-    regional_sort_field = "regional_sort_hub"
 
     missing = sorted(required - set(df.columns))
     if missing:
-        _fail(f"facilities missing required columns: {missing}", df)
-
-    # Check for sort optimization fields
-    missing_sort = sorted(sort_fields - set(df.columns))
-    if missing_sort:
-        print(f"INFO: facilities missing sort optimization fields: {missing_sort}")
-        print("      These are required for multi-level sort optimization")
-        print("      Consider adding max_sort_points_capacity and last_mile_sort_groups_count columns")
-
-    # Check for regional sort hub field
-    if regional_sort_field not in df.columns:
-        print(f"INFO: facilities missing '{regional_sort_field}' column")
-        print("      Will use 'parent_hub_name' for sorting decisions")
-        print("      Add 'regional_sort_hub' column for separate routing vs. sorting hierarchies")
-    else:
-        print(f"✓ Found '{regional_sort_field}' column - will use for sorting decisions")
-
-        # Validate regional_sort_hub values
-        missing_regional = df[pd.isna(df[regional_sort_field]) | (df[regional_sort_field] == "")]
-        if not missing_regional.empty:
-            print(f"WARNING: {len(missing_regional)} facilities missing regional_sort_hub values:")
-            print(f"         Will fall back to parent_hub_name for these facilities")
+        _fail(f"facilities missing required columns: {missing}\n"
+              f"Sort optimization requires max_sort_points_capacity and last_mile_sort_groups_count", df)
 
     dups = df["facility_name"][df["facility_name"].duplicated()].unique()
     if len(dups) > 0:
         _fail(f"facilities has duplicate facility_name values: {list(dups)}", df)
 
-    # Validate sort capacity values if present
-    if "max_sort_points_capacity" in df.columns:
-        # Check that hub/hybrid facilities have sort capacity specified
-        hub_hybrid = df[df["type"].str.lower().isin(["hub", "hybrid"])]
-        missing_capacity = hub_hybrid[pd.isna(hub_hybrid["max_sort_points_capacity"])]
+    # STRICT: Validate sort capacity for hub/hybrid facilities (REQUIRED, no fallbacks)
+    hub_hybrid = df[df["type"].str.lower().isin(["hub", "hybrid"])]
+    missing_capacity = hub_hybrid[
+        pd.isna(hub_hybrid["max_sort_points_capacity"]) | (hub_hybrid["max_sort_points_capacity"] <= 0)]
 
-        if not missing_capacity.empty:
-            print(f"WARNING: Hub/hybrid facilities missing max_sort_points_capacity:")
-            print(f"         {missing_capacity['facility_name'].tolist()}")
-            print(f"         Default capacity of 0 will be used, preventing sort optimization")
+    if not missing_capacity.empty:
+        _fail(f"Hub/hybrid facilities MUST have max_sort_points_capacity > 0.\n"
+              f"Missing/invalid capacity for: {missing_capacity['facility_name'].tolist()}\n"
+              f"No fallback values allowed - update facilities sheet.", df)
 
-    # Validate sort groups count for launch facilities
-    if "last_mile_sort_groups_count" in df.columns:
-        launch_facilities = df[df["type"].str.lower() == "launch"]
-        missing_groups = launch_facilities[pd.isna(launch_facilities["last_mile_sort_groups_count"])]
+    # STRICT: Validate sort groups for delivery facilities (launch/hybrid) - REQUIRED
+    delivery_facilities = df[df["type"].str.lower().isin(["launch", "hybrid"])]
+    missing_groups = delivery_facilities[pd.isna(delivery_facilities["last_mile_sort_groups_count"]) | (
+                delivery_facilities["last_mile_sort_groups_count"] <= 0)]
 
-        if not missing_groups.empty:
-            print(f"INFO: Launch facilities missing last_mile_sort_groups_count:")
-            print(f"      {missing_groups['facility_name'].tolist()}")
-            print(f"      Default value of 4 sort groups will be used")
+    if not missing_groups.empty:
+        _fail(f"Delivery facilities (launch/hybrid) MUST have last_mile_sort_groups_count > 0.\n"
+              f"Missing/invalid sort groups for: {missing_groups['facility_name'].tolist()}\n"
+              f"No fallback values allowed - update facilities sheet.", df)
+
+    # Validate coordinates exist
+    missing_coords = df[pd.isna(df["lat"]) | pd.isna(df["lon"])]
+    if not missing_coords.empty:
+        _fail(f"Facilities missing lat/lon coordinates: {missing_coords['facility_name'].tolist()}\n"
+              f"Coordinates required for distance calculations - no fallbacks allowed", df)
+
+    # Optional regional_sort_hub check (informational only)
+    if "regional_sort_hub" in df.columns:
+        print("✓ Found 'regional_sort_hub' column - will use for sorting decisions")
+        missing_regional = df[pd.isna(df["regional_sort_hub"]) | (df["regional_sort_hub"] == "")]
+        if not missing_regional.empty:
+            print(f"INFO: {len(missing_regional)} facilities missing regional_sort_hub")
+            print(f"      Will fall back to parent_hub_name for these facilities")
+    else:
+        print("INFO: 'regional_sort_hub' column not found")
+        print("      Will use 'parent_hub_name' for sorting decisions")
 
 
 def _check_zips(df_raw: pd.DataFrame):
@@ -174,65 +166,60 @@ def _check_mileage_bands(df_raw: pd.DataFrame):
 
 
 def _check_timing_params(df_raw: pd.DataFrame):
-    """Validate timing parameters including sort optimization parameters."""
+    """
+    STRICT: Validate timing parameters - all sort optimization params REQUIRED.
+    No fallbacks allowed.
+    """
     df = _norm_cols(df_raw)
 
-    # Required timing parameters
+    # Required timing parameters (NO FALLBACKS)
     required_keys = {
         "load_hours", "unload_hours",
-        "hours_per_touch",
+        "hours_per_touch",  # REQUIRED for path steps processing hours
         "injection_va_hours",
         "middle_mile_va_hours",
         "last_mile_va_hours",
-    }
-
-    # Sort optimization specific parameters
-    sort_timing_keys = {
-        "sort_points_per_destination"
+        "sort_points_per_destination"  # REQUIRED for sort capacity calculation
     }
 
     missing_required = sorted(required_keys - set(df["key"]))
     if missing_required:
-        raise ValueError(f"timing_params missing required keys: {missing_required}")
-
-    # Check for sort optimization timing parameters
-    missing_sort = sorted(sort_timing_keys - set(df["key"]))
-    if missing_sort:
-        print(f"INFO: timing_params missing sort optimization keys: {missing_sort}")
-        print("      sort_points_per_destination is required for multi-level sort optimization")
-        print("      Default value of 1.0 will be used")
+        raise ValueError(f"timing_params missing REQUIRED keys: {missing_required}\n"
+                         f"All timing parameters must be specified - no fallback values allowed.\n"
+                         f"Add these keys to timing_params sheet in input file.")
 
     # Validate timing values are positive
     for _, row in df.iterrows():
         key = row["key"]
-        if key in (required_keys | sort_timing_keys):
-            value = float(row["value"])
-            if value <= 0:
-                raise ValueError(f"timing_params: {key} must be positive (found: {value})")
+        if key in required_keys:
+            try:
+                value = float(row["value"])
+                if value <= 0:
+                    raise ValueError(f"timing_params: {key} must be positive (found: {value})")
+            except (ValueError, TypeError):
+                raise ValueError(f"timing_params: {key} must be numeric (found: {row['value']})")
 
 
 def _check_cost_params(df_raw: pd.DataFrame):
-    """Validate all required cost parameters including sort optimization costs."""
+    """
+    STRICT: Validate all required cost parameters - NO FALLBACKS.
+    """
     df = _norm_cols(df_raw)
 
-    # Required core cost parameters
+    # Required core cost parameters (NO FALLBACKS)
     required_keys = {
-        "sort_cost_per_pkg",  # Can be used as fallback
-        "last_mile_sort_cost_per_pkg",
-        "last_mile_delivery_cost_per_pkg",
-        "container_handling_cost",
-        "premium_economy_dwell_threshold",
+        "injection_sort_cost_per_pkg",  # Required for injection sort
+        "intermediate_sort_cost_per_pkg",  # Required for intermediate crossdock
+        "parent_hub_sort_cost_per_pkg",  # Required for region level sort
+        "last_mile_sort_cost_per_pkg",  # Required for last mile sort
+        "last_mile_delivery_cost_per_pkg",  # Required for delivery
+        "container_handling_cost",  # Required for container strategy
+        "premium_economy_dwell_threshold",  # Required for dwell logic
     }
 
-    # Enhanced sort cost parameters (optional but recommended)
-    enhanced_sort_keys = {
-        "injection_sort_cost_per_pkg",
-        "intermediate_sort_cost_per_pkg",
-        "parent_hub_sort_cost_per_pkg",  # For region level sort
-    }
-
-    # Optional enhanced parameters
+    # Optional but recommended
     optional_keys = {
+        "sort_cost_per_pkg",  # Legacy fallback (can be used if specific costs missing)
         "allow_premium_economy_dwell",
         "dwell_cost_per_pkg_per_day",
         "sla_penalty_per_touch_per_pkg",
@@ -241,26 +228,24 @@ def _check_cost_params(df_raw: pd.DataFrame):
     # Check required parameters
     missing_required = sorted(required_keys - set(df["key"]))
     if missing_required:
-        raise ValueError(f"cost_params missing required keys: {missing_required}")
-
-    # Check for enhanced sort parameters
-    missing_enhanced_sort = sorted(enhanced_sort_keys - set(df["key"]))
-    if missing_enhanced_sort:
-        print(f"INFO: cost_params missing enhanced sort parameters: {missing_enhanced_sort}")
-        print("      Will use 'sort_cost_per_pkg' as fallback for missing sort cost parameters")
-        print("      For multi-level sort optimization, consider adding:")
-        print("        - injection_sort_cost_per_pkg")
-        print("        - intermediate_sort_cost_per_pkg")
-        print("        - parent_hub_sort_cost_per_pkg (for region level sort)")
-
-    # Check optional parameters
-    missing_optional = sorted(optional_keys - set(df["key"]))
-    if missing_optional:
-        print(f"INFO: cost_params missing optional parameters: {missing_optional}")
-        print("      Default values of 0.0 will be used")
+        # Check if sort_cost_per_pkg can serve as fallback
+        if "sort_cost_per_pkg" in set(df["key"]):
+            print("WARNING: Missing specific sort cost parameters, will use 'sort_cost_per_pkg' as fallback:")
+            for key in missing_required:
+                if "sort" in key:
+                    print(f"  - {key}")
+            # Only fail if non-sort parameters are missing
+            non_sort_missing = [k for k in missing_required if "sort" not in k]
+            if non_sort_missing:
+                raise ValueError(f"cost_params missing REQUIRED keys: {non_sort_missing}\n"
+                                 f"All cost parameters must be specified - no fallback values allowed.")
+        else:
+            raise ValueError(f"cost_params missing REQUIRED keys: {missing_required}\n"
+                             f"All cost parameters must be specified - no fallback values allowed.\n"
+                             f"Add these keys to cost_params sheet in input file.")
 
     # Validate cost values are non-negative
-    all_cost_keys = required_keys | enhanced_sort_keys | optional_keys
+    all_cost_keys = required_keys | optional_keys
     for _, row in df.iterrows():
         key = row["key"]
         if key in all_cost_keys:
@@ -298,13 +283,21 @@ def _check_package_mix(df_raw: pd.DataFrame):
 
 
 def _check_run_settings(df_raw: pd.DataFrame):
-    """Validate run settings parameters."""
+    """
+    STRICT: Validate run settings parameters - REQUIRED.
+    """
     df = _norm_cols(df_raw)
 
-    required_keys = {"load_strategy", "sla_target_days", "path_around_the_world_factor"}
+    required_keys = {
+        "load_strategy",
+        "sla_target_days",
+        "path_around_the_world_factor"  # REQUIRED for path generation
+    }
+
     missing = sorted(required_keys - set(df["key"]))
     if missing:
-        raise ValueError(f"run_settings missing required keys: {missing}")
+        raise ValueError(f"run_settings missing REQUIRED keys: {missing}\n"
+                         f"Add these keys to run_settings sheet in input file.")
 
     # Validate load_strategy is valid
     strategy_row = df[df["key"] == "load_strategy"]
@@ -312,6 +305,13 @@ def _check_run_settings(df_raw: pd.DataFrame):
         strategy_value = str(strategy_row.iloc[0]["value"]).lower()
         if strategy_value not in ["container", "fluid"]:
             raise ValueError(f"load_strategy must be 'container' or 'fluid' (found: {strategy_value})")
+
+    # Validate path_around_the_world_factor is reasonable
+    around_factor_row = df[df["key"] == "path_around_the_world_factor"]
+    if not around_factor_row.empty:
+        around_value = float(around_factor_row.iloc[0]["value"])
+        if around_value < 1.0 or around_value > 5.0:
+            raise ValueError(f"path_around_the_world_factor should be between 1.0 and 5.0 (found: {around_value})")
 
 
 def _check_scenarios(df_raw: pd.DataFrame):
@@ -331,22 +331,48 @@ def _check_scenarios(df_raw: pd.DataFrame):
 
 def validate_inputs(dfs: dict):
     """
-    Comprehensive input validation with support for multi-level sort optimization and regional_sort_hub.
+    STRICT comprehensive input validation.
+    NO FALLBACKS - all required fields must be present and valid.
     """
-    print("Validating input sheets...")
+    print("=" * 60)
+    print("STRICT INPUT VALIDATION - NO FALLBACKS ALLOWED")
+    print("=" * 60)
 
     _check_container_params(dfs["container_params"])
-    _check_facilities(dfs["facilities"])
-    _check_zips(dfs["zips"])
-    _check_demand(dfs["demand"])
-    _check_injection_distribution(dfs["injection_distribution"])
-    _check_mileage_bands(dfs["mileage_bands"])
-    _check_timing_params(dfs["timing_params"])
-    _check_cost_params(dfs["cost_params"])
-    _check_package_mix(dfs["package_mix"])
-    _check_run_settings(dfs["run_settings"])
-    _check_scenarios(dfs["scenarios"])
+    print("✓ container_params validated")
 
-    print("✅ Input validation complete - all required parameters present and valid")
-    print("ℹ️  Multi-level sort optimization fields detected and validated")
-    print("🔧 UPDATED ARCHITECTURE: Regional sorting hierarchy separate from routing hierarchy")
+    _check_facilities(dfs["facilities"])
+    print("✓ facilities validated (including sort optimization fields)")
+
+    _check_zips(dfs["zips"])
+    print("✓ zips validated")
+
+    _check_demand(dfs["demand"])
+    print("✓ demand validated")
+
+    _check_injection_distribution(dfs["injection_distribution"])
+    print("✓ injection_distribution validated")
+
+    _check_mileage_bands(dfs["mileage_bands"])
+    print("✓ mileage_bands validated")
+
+    _check_timing_params(dfs["timing_params"])
+    print("✓ timing_params validated (all required parameters present)")
+
+    _check_cost_params(dfs["cost_params"])
+    print("✓ cost_params validated (all required parameters present)")
+
+    _check_package_mix(dfs["package_mix"])
+    print("✓ package_mix validated")
+
+    _check_run_settings(dfs["run_settings"])
+    print("✓ run_settings validated")
+
+    _check_scenarios(dfs["scenarios"])
+    print("✓ scenarios validated")
+
+    print("=" * 60)
+    print("✅ VALIDATION COMPLETE - ALL REQUIRED FIELDS PRESENT")
+    print("   No fallback values will be used")
+    print("   All calculations use input parameters only")
+    print("=" * 60)

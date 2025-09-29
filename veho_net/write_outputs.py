@@ -1,3 +1,4 @@
+# veho_net/write_outputs.py - FIXED: Improved sort_capacity sheet calculation
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -17,13 +18,28 @@ def write_workbook(path, scenario_summary, od_out, path_detail, dwell_hotspots, 
     """Write simplified workbook with core sheets only (backward compatibility)."""
     return write_workbook_with_sort_analysis(
         path, scenario_summary, od_out, path_detail, dwell_hotspots,
-        facility_rollup, arc_summary, kpis, pd.DataFrame()
+        facility_rollup, arc_summary, kpis, pd.DataFrame(), None, None
     )
 
 
 def write_workbook_with_sort_analysis(path, scenario_summary, od_out, path_detail, dwell_hotspots, facility_rollup,
-                                      arc_summary, kpis, sort_summary=None):
-    """EXTENDED: Write workbook with multi-level sort analysis included."""
+                                      arc_summary, kpis, sort_summary=None, facilities=None, timing_kv=None):
+    """
+    EXTENDED: Write workbook with multi-level sort analysis included.
+
+    Args:
+        path: Output file path
+        scenario_summary: Scenario summary data
+        od_out: OD selected paths
+        path_detail: Path steps detail
+        dwell_hotspots: Dwell hotspot analysis
+        facility_rollup: Facility volume rollup
+        arc_summary: Arc/lane summary
+        kpis: Network KPIs
+        sort_summary: Sort level decision summary
+        facilities: Facility data (required for sort capacity calculation)
+        timing_kv: Timing parameters (required for sort capacity calculation)
+    """
     try:
         with pd.ExcelWriter(path, engine="xlsxwriter") as xw:
 
@@ -118,10 +134,33 @@ def write_workbook_with_sort_analysis(path, scenario_summary, od_out, path_detai
                     ])
                     baseline_comparison.to_excel(xw, sheet_name="baseline_comparison", index=False)
 
-                # Sort capacity utilization
-                sort_capacity = create_sort_capacity_analysis(sort_summary, facility_rollup)
-                if not sort_capacity.empty:
-                    sort_capacity.to_excel(xw, sheet_name="sort_capacity", index=False)
+                # FIXED: Sort capacity utilization with actual input parameters
+                # Only create if we have the required parameters
+                if facilities is not None and timing_kv is not None:
+                    try:
+                        sort_capacity = create_sort_capacity_analysis(
+                            sort_summary,
+                            facility_rollup,
+                            facilities=facilities,
+                            timing_kv=timing_kv
+                        )
+                        if not sort_capacity.empty:
+                            sort_capacity.to_excel(xw, sheet_name="sort_capacity", index=False)
+                    except Exception as e:
+                        print(f"  Warning: Could not create sort_capacity sheet: {e}")
+                        # Write error message to sheet
+                        error_df = pd.DataFrame([{
+                            'error': f'Sort capacity analysis failed: {e}',
+                            'note': 'Requires facilities and timing_kv parameters'
+                        }])
+                        error_df.to_excel(xw, sheet_name="sort_capacity", index=False)
+                else:
+                    print("  Warning: facilities or timing_kv not provided - skipping sort_capacity sheet")
+                    error_df = pd.DataFrame([{
+                        'note': 'Sort capacity analysis skipped - missing required parameters',
+                        'required': 'facilities DataFrame and timing_kv dict'
+                    }])
+                    error_df.to_excel(xw, sheet_name="sort_capacity", index=False)
             else:
                 pd.DataFrame([{"note": "No sort analysis data"}]).to_excel(
                     xw, sheet_name="sort_analysis", index=False)
@@ -130,6 +169,8 @@ def write_workbook_with_sort_analysis(path, scenario_summary, od_out, path_detai
 
     except Exception as e:
         print(f"Error writing workbook {path}: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -159,7 +200,7 @@ def create_sort_level_summary_stats(sort_summary: pd.DataFrame, baseline_metrics
         sort_level_stats['pct_of_ods'] = (sort_level_stats['od_count'] / total_ods * 100).round(1)
         sort_level_stats['pct_of_volume'] = (sort_level_stats['total_volume'] / total_volume * 100).round(1)
         sort_level_stats['avg_cost_per_pkg'] = (
-                    sort_level_stats['total_cost'] / sort_level_stats['total_volume']).round(3)
+                sort_level_stats['total_cost'] / sort_level_stats['total_volume']).round(3)
 
         # Summary row with baseline comparison if provided
         summary_data = {
@@ -189,33 +230,134 @@ def create_sort_level_summary_stats(sort_summary: pd.DataFrame, baseline_metrics
         return pd.DataFrame([{"error": f"Could not create sort stats: {e}"}])
 
 
-def create_sort_capacity_analysis(sort_summary: pd.DataFrame, facility_rollup: pd.DataFrame) -> pd.DataFrame:
-    """Create analysis of sort capacity utilization by facility."""
+def create_sort_capacity_analysis(sort_summary: pd.DataFrame, facility_rollup: pd.DataFrame,
+                                  facilities: pd.DataFrame = None, timing_kv: dict = None) -> pd.DataFrame:
+    """
+    FIXED: Create analysis of sort capacity utilization by facility.
+    NO HARDCODED VALUES - all from input parameters.
+
+    Args:
+        sort_summary: Sort decision summary with OD-level data
+        facility_rollup: Facility volume data
+        facilities: Facility master data with last_mile_sort_groups_count
+        timing_kv: Timing parameters with sort_points_per_destination
+
+    Returns:
+        DataFrame with sort capacity analysis using actual input values
+    """
     try:
         if sort_summary.empty or facility_rollup.empty:
             return pd.DataFrame()
 
+        # Get required parameters from inputs (no fallbacks)
+        if timing_kv is None:
+            raise ValueError("timing_kv is required for sort_points_per_destination")
+
+        if 'sort_points_per_destination' not in timing_kv:
+            raise ValueError("timing_params.sort_points_per_destination is required")
+
+        sort_points_per_dest = float(timing_kv['sort_points_per_destination'])
+
+        # Create facility lookup for sort groups
+        if facilities is None:
+            raise ValueError("facilities DataFrame is required for last_mile_sort_groups_count")
+
+        facility_lookup = facilities.set_index('facility_name')
+
+        # Validate required columns exist
+        if 'last_mile_sort_groups_count' not in facility_lookup.columns:
+            raise ValueError("facilities.last_mile_sort_groups_count column is required")
+
         # Aggregate sort requirements by origin facility
-        sort_requirements = sort_summary.groupby('origin').agg({
-            'pkgs_day': 'sum',
-            'chosen_sort_level': lambda x: x.value_counts().to_dict()
-        }).reset_index()
+        capacity_data = []
 
-        # Join with facility data
-        capacity_analysis = sort_requirements.merge(
-            facility_rollup[['facility', 'injection_pkgs_day', 'peak_hourly_throughput']],
-            left_on='origin',
-            right_on='facility',
-            how='left'
-        )
+        for facility in sort_summary['origin'].unique():
+            facility_ods = sort_summary[sort_summary['origin'] == facility]
 
-        # Calculate estimated sort point usage (simplified)
-        capacity_analysis['estimated_sort_points'] = capacity_analysis['pkgs_day'] / 1000  # Simplified estimate
+            # Get facility rollup data
+            facility_info = facility_rollup[facility_rollup['facility'] == facility]
 
-        return capacity_analysis.drop(columns=['facility'])
+            if facility_info.empty:
+                continue
+
+            facility_info = facility_info.iloc[0]
+
+            # Calculate sort level distribution for this facility
+            sort_level_counts = facility_ods['chosen_sort_level'].value_counts()
+
+            # Calculate estimated sort points using ACTUAL input parameters
+            estimated_sort_points = 0
+
+            # Region level: sort_points_per_dest × unique regional hubs
+            region_ods = facility_ods[facility_ods['chosen_sort_level'] == 'region']
+            if not region_ods.empty:
+                unique_regional_hubs = region_ods['dest_regional_sort_hub'].nunique()
+                estimated_sort_points += unique_regional_hubs * sort_points_per_dest
+
+            # Market level: sort_points_per_dest × destinations
+            market_ods = facility_ods[facility_ods['chosen_sort_level'] == 'market']
+            if not market_ods.empty:
+                estimated_sort_points += len(market_ods) * sort_points_per_dest
+
+            # Sort group level: sort_points_per_dest × destinations × actual sort_groups_count
+            sort_group_ods = facility_ods[facility_ods['chosen_sort_level'] == 'sort_group']
+            if not sort_group_ods.empty:
+                # Calculate based on ACTUAL sort groups for each destination
+                for _, od_row in sort_group_ods.iterrows():
+                    dest = od_row['dest']
+
+                    # Get actual sort_groups_count from facilities input
+                    if dest not in facility_lookup.index:
+                        raise ValueError(f"Destination {dest} not found in facilities data")
+
+                    dest_sort_groups = facility_lookup.at[dest, 'last_mile_sort_groups_count']
+
+                    if pd.isna(dest_sort_groups):
+                        raise ValueError(f"Missing last_mile_sort_groups_count for facility {dest}")
+
+                    dest_sort_groups = float(dest_sort_groups)
+                    estimated_sort_points += sort_points_per_dest * dest_sort_groups
+
+            # Get capacity info from facility_rollup (should come from facilities.max_sort_points_capacity)
+            max_capacity = facility_info.get('max_sort_points_capacity', None)
+
+            if max_capacity is None or pd.isna(max_capacity):
+                # Try to get from facilities directly
+                if facility in facility_lookup.index:
+                    max_capacity = facility_lookup.at[facility, 'max_sort_points_capacity']
+
+                if max_capacity is None or pd.isna(max_capacity):
+                    raise ValueError(f"Missing max_sort_points_capacity for facility {facility}")
+
+            max_capacity = float(max_capacity)
+
+            if max_capacity <= 0:
+                raise ValueError(f"Invalid max_sort_points_capacity ({max_capacity}) for facility {facility}")
+
+            capacity_utilization_pct = (estimated_sort_points / max_capacity * 100)
+
+            capacity_data.append({
+                'facility': facility,
+                'injection_pkgs_day': facility_info.get('injection_pkgs_day', 0),
+                'num_destinations': len(facility_ods),
+                'num_region_sort': int(sort_level_counts.get('region', 0)),
+                'num_market_sort': int(sort_level_counts.get('market', 0)),
+                'num_sort_group': int(sort_level_counts.get('sort_group', 0)),
+                'estimated_sort_points': int(estimated_sort_points),
+                'sort_points_per_destination': sort_points_per_dest,
+                'max_sort_capacity': int(max_capacity),
+                'capacity_utilization_pct': round(capacity_utilization_pct, 1),
+                'available_capacity': int(max_capacity - estimated_sort_points),
+                'peak_hourly_throughput': facility_info.get('peak_hourly_throughput', 0)
+            })
+
+        return pd.DataFrame(capacity_data).sort_values('capacity_utilization_pct', ascending=False)
 
     except Exception as e:
-        return pd.DataFrame([{"error": f"Could not create capacity analysis: {e}"}])
+        print(f"Error creating sort capacity analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        raise  # Re-raise to expose issues rather than hiding with fallbacks
 
 
 def write_compare_workbook(path, compare_df: pd.DataFrame, run_kv: dict):

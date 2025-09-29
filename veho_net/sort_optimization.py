@@ -1,4 +1,4 @@
-# veho_net/sort_optimization.py - Updated to use regional_sort_hub for sorting decisions
+# veho_net/sort_optimization.py - FIXED: O=D handling and parent hub sort costs
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Set
@@ -179,7 +179,8 @@ def aggregate_facility_volumes(od_selected: pd.DataFrame, facilities: pd.DataFra
 def calculate_sort_level_costs(od_row: pd.Series, sort_level: str, cost_kv: Dict,
                                facilities: pd.DataFrame) -> Dict[str, float]:
     """
-    Calculate processing costs for an OD pair based on chosen sort level.
+    FIXED: Calculate processing costs for an OD pair based on chosen sort level.
+    Handles O=D correctly (no linehaul, no intermediate costs).
     Uses regional_sort_hub for regional cost calculations.
 
     Returns:
@@ -187,6 +188,7 @@ def calculate_sort_level_costs(od_row: pd.Series, sort_level: str, cost_kv: Dict
     """
     relationships = build_facility_relationships(facilities)
     regional_sort_hub_map = relationships['regional_sort_hub_map']
+    facility_types = relationships['facility_types']
 
     # Get cost parameters
     injection_sort_pp = float(cost_kv.get("injection_sort_cost_per_pkg",
@@ -209,10 +211,10 @@ def calculate_sort_level_costs(od_row: pd.Series, sort_level: str, cost_kv: Dict
     else:
         nodes = [origin, dest]
 
-    intermediate_facilities = nodes[1:-1] if len(nodes) > 2 else []
-    dest_regional_sort_hub = regional_sort_hub_map[dest]
+    # FIXED: Check for O=D (self-destination)
+    is_self_destination = (origin == dest)
 
-    # Calculate costs based on sort level
+    # Initialize costs
     costs = {
         'injection_sort_cost': injection_sort_pp * volume,
         'intermediate_crossdock_cost': 0.0,
@@ -221,13 +223,28 @@ def calculate_sort_level_costs(od_row: pd.Series, sort_level: str, cost_kv: Dict
         'last_mile_delivery_cost': last_mile_delivery_pp * volume
     }
 
-    # Intermediate crossdock costs (always apply)
+    # FIXED: For O=D, only apply injection sort + last mile delivery
+    # No intermediate costs, no parent hub sort, and sort level is always sort_group
+    if is_self_destination:
+        # O=D must use sort_group level (facility sorting for its own delivery)
+        costs['last_mile_sort_cost'] = 0.0  # Already sorted at injection
+        costs['intermediate_crossdock_cost'] = 0.0  # No crossdock
+        costs['parent_hub_sort_cost'] = 0.0  # No parent hub
+        return costs
+
+    # For O≠D, process normally
+    intermediate_facilities = nodes[1:-1] if len(nodes) > 2 else []
+    dest_regional_sort_hub = regional_sort_hub_map[dest]
+
+    # Intermediate crossdock costs (always apply for O≠D with intermediate stops)
     costs['intermediate_crossdock_cost'] = len(intermediate_facilities) * intermediate_crossdock_pp * volume
 
+    # Apply sort level logic for O≠D only
     if sort_level == 'region':
-        # Region level: regional sort hub sorts, last mile facility also sorts
+        # Region level: regional sort hub sorts if it's in the path and different from dest
         if dest_regional_sort_hub != dest and dest_regional_sort_hub in nodes:
             costs['parent_hub_sort_cost'] = parent_hub_sort_pp * volume
+        # Last mile facility also sorts after regional hub
         costs['last_mile_sort_cost'] = last_mile_sort_pp * volume
 
     elif sort_level == 'market':
@@ -235,7 +252,7 @@ def calculate_sort_level_costs(od_row: pd.Series, sort_level: str, cost_kv: Dict
         costs['last_mile_sort_cost'] = last_mile_sort_pp * volume
 
     elif sort_level == 'sort_group':
-        # Sort group level: no last mile sort needed
+        # Sort group level: no last mile sort needed (pre-sorted to route groups)
         costs['last_mile_sort_cost'] = 0.0
     else:
         raise ValueError(f"Invalid sort level: {sort_level}")
@@ -293,33 +310,24 @@ def validate_sort_capacity_constraints(sort_requirements: Dict, facilities: pd.D
 
 def get_sort_level_options(od_row: pd.Series, facilities: pd.DataFrame) -> List[str]:
     """
-    CORRECTED: Determine valid sort level options for an OD pair based on facility constraints.
+    FIXED: Determine valid sort level options for an OD pair.
 
     Business Rules:
-    - All middle-mile ODs (O≠D) have origins that are hub/hybrid (launch only does direct injection)
-    - Destinations can be launch or hybrid (pure hubs don't do delivery)
-    - All destinations can have sort groups (launch facilities AND hybrid facilities do delivery)
-    - Therefore: ALL middle-mile ODs should support region, market, and sort_group levels
+    - O=D (self-destination): MUST use sort_group (facility sorting for its own delivery)
+    - O≠D (middle-mile): Can use region, market, or sort_group
 
     Returns:
-        List of valid sort levels: ['region', 'market', 'sort_group']
+        List of valid sort levels
     """
-    relationships = build_facility_relationships(facilities)
-    facility_types = relationships['facility_types']
-
     origin = od_row['origin']
     dest = od_row['dest']
 
-    # For middle-mile ODs (O≠D), origin must be hub/hybrid and dest must be launch/hybrid
-    # All such ODs should support all three sort levels
+    # FIXED: O=D must use sort_group level only
+    if origin == dest:
+        return ['sort_group']
 
-    if origin != dest:
-        # Middle-mile OD: should support all sort levels
-        return ['region', 'market', 'sort_group']
-    else:
-        # Self-destination (hybrid facility sorting for its own delivery)
-        # Should also support all sort levels
-        return ['region', 'market', 'sort_group']
+    # O≠D can use all three levels
+    return ['region', 'market', 'sort_group']
 
 
 def calculate_sort_level_savings(od_row: pd.Series, cost_kv: Dict, facilities: pd.DataFrame) -> Dict[str, float]:
@@ -350,7 +358,7 @@ def calculate_sort_level_savings(od_row: pd.Series, cost_kv: Dict, facilities: p
 def build_sort_decision_summary(od_selected: pd.DataFrame, sort_decisions: Dict,
                                 cost_kv: Dict, facilities: pd.DataFrame) -> pd.DataFrame:
     """
-    Build summary of sort level decisions and their impact.
+    FIXED: Build summary of sort level decisions with accurate cost breakdown.
 
     Returns:
         DataFrame with sort decision analysis
@@ -374,6 +382,7 @@ def build_sort_decision_summary(od_selected: pd.DataFrame, sort_decisions: Dict,
             'dest': od_row['dest'],
             'dest_regional_sort_hub': regional_sort_hub_map.get(od_row['dest'], od_row['dest']),
             'pkgs_day': od_row.get('pkgs_day', 0),
+            'is_self_destination': (od_row['origin'] == od_row['dest']),
             'chosen_sort_level': chosen_sort_level,
             'total_sort_cost': sum(costs.values()),
             'injection_sort_cost': costs['injection_sort_cost'],

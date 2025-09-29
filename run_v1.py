@@ -1,4 +1,4 @@
-# run_v1.py - UPDATED: Pass container parameters to reporting functions for container metrics
+# run_v1.py - COMPLETE: All fixes integrated, no hardcoded values
 import argparse
 from pathlib import Path
 import pandas as pd
@@ -9,6 +9,7 @@ from veho_net.validators import validate_inputs
 from veho_net.build_structures import build_od_and_direct, candidate_paths
 from veho_net.time_cost import containers_for_pkgs_day
 from veho_net.milp import solve_arc_pooled_path_selection_with_sort_optimization
+from veho_net.geo import haversine_miles, band_lookup
 from veho_net.reporting import (
     _identify_volume_types_with_costs,
     _calculate_hourly_throughput_with_costs,
@@ -28,6 +29,140 @@ from veho_net.write_outputs import (
 OUTPUT_FILE_TEMPLATE = "{scenario_id}_{strategy}.xlsx"
 COMPARE_FILE_TEMPLATE = "{scenario_id}_compare.xlsx"
 EXECUTIVE_SUMMARY_TEMPLATE = "{scenario_id}_exec_sum.xlsx"
+
+
+def _generate_path_steps_from_od(od_selected: pd.DataFrame, facilities: pd.DataFrame,
+                                 mileage_bands: pd.DataFrame, timing_local: dict,
+                                 scenario_id: str) -> pd.DataFrame:
+    """
+    Generate path steps with actual calculated distances and timing.
+    NO HARDCODED VALUES - all from inputs.
+
+    Args:
+        od_selected: Selected OD paths with path_str
+        facilities: Facility data with coordinates
+        mileage_bands: Mileage bands for distance/cost/timing lookup
+        timing_local: Timing parameters including hours_per_touch
+        scenario_id: Scenario identifier
+
+    Returns:
+        DataFrame with path steps including actual distance, drive hours, processing hours
+    """
+    path_steps = []
+
+    # Create facility lookup for coordinates
+    fac_lookup = facilities.set_index('facility_name')[['lat', 'lon']].astype(float)
+
+    # Get processing hours from timing params (required, no fallback)
+    hours_per_touch = float(timing_local['hours_per_touch'])
+
+    for _, od_row in od_selected.iterrows():
+        path_str = str(od_row.get('path_str', f"{od_row['origin']}->{od_row['dest']}"))
+
+        if '->' not in path_str:
+            # Direct path with no intermediate steps
+            origin = od_row['origin']
+            dest = od_row['dest']
+
+            # Check for O=D (self-destination)
+            if origin == dest:
+                # O=D: No linehaul, just processing
+                path_steps.append({
+                    'scenario_id': scenario_id,
+                    'origin': origin,
+                    'dest': dest,
+                    'step_order': 1,
+                    'from_facility': origin,
+                    'to_facility': dest,
+                    'distance_miles': 0.0,  # ✅ APPROVED HARDCODE: O=D has no distance
+                    'drive_hours': 0.0,  # ✅ APPROVED HARDCODE: O=D has no drive time
+                    'processing_hours_at_destination': hours_per_touch
+                })
+            else:
+                # Calculate actual distance for direct O≠D path
+                if origin in fac_lookup.index and dest in fac_lookup.index:
+                    lat1, lon1 = fac_lookup.at[origin, 'lat'], fac_lookup.at[origin, 'lon']
+                    lat2, lon2 = fac_lookup.at[dest, 'lat'], fac_lookup.at[dest, 'lon']
+                    raw_dist = haversine_miles(lat1, lon1, lat2, lon2)
+
+                    # Get timing/cost from mileage bands
+                    fixed, var, circuit, mph = band_lookup(raw_dist, mileage_bands)
+                    actual_dist = raw_dist * circuit
+                    drive_hours = actual_dist / mph
+
+                    path_steps.append({
+                        'scenario_id': scenario_id,
+                        'origin': origin,
+                        'dest': dest,
+                        'step_order': 1,
+                        'from_facility': origin,
+                        'to_facility': dest,
+                        'distance_miles': actual_dist,
+                        'drive_hours': drive_hours,
+                        'processing_hours_at_destination': hours_per_touch
+                    })
+            continue
+
+        # Multi-leg path - parse nodes
+        nodes = path_str.split('->')
+
+        for i, (from_fac, to_fac) in enumerate(zip(nodes[:-1], nodes[1:])):
+            from_fac = from_fac.strip()
+            to_fac = to_fac.strip()
+
+            # Check for O=D leg (shouldn't happen in multi-leg, but defensive)
+            if from_fac == to_fac:
+                path_steps.append({
+                    'scenario_id': scenario_id,
+                    'origin': od_row['origin'],
+                    'dest': od_row['dest'],
+                    'step_order': i + 1,
+                    'from_facility': from_fac,
+                    'to_facility': to_fac,
+                    'distance_miles': 0.0,  # ✅ APPROVED HARDCODE: O=D has no distance
+                    'drive_hours': 0.0,  # ✅ APPROVED HARDCODE: O=D has no drive time
+                    'processing_hours_at_destination': hours_per_touch
+                })
+                continue
+
+            # Calculate actual distance and timing for this leg
+            if from_fac in fac_lookup.index and to_fac in fac_lookup.index:
+                lat1, lon1 = fac_lookup.at[from_fac, 'lat'], fac_lookup.at[from_fac, 'lon']
+                lat2, lon2 = fac_lookup.at[to_fac, 'lat'], fac_lookup.at[to_fac, 'lon']
+                raw_dist = haversine_miles(lat1, lon1, lat2, lon2)
+
+                # Get timing/cost from mileage bands
+                fixed, var, circuit, mph = band_lookup(raw_dist, mileage_bands)
+                actual_dist = raw_dist * circuit
+                drive_hours = actual_dist / mph
+
+                path_steps.append({
+                    'scenario_id': scenario_id,
+                    'origin': od_row['origin'],
+                    'dest': od_row['dest'],
+                    'step_order': i + 1,
+                    'from_facility': from_fac,
+                    'to_facility': to_fac,
+                    'distance_miles': actual_dist,
+                    'drive_hours': drive_hours,
+                    'processing_hours_at_destination': hours_per_touch
+                })
+            else:
+                # Missing facility coordinates - should be caught by validation
+                print(f"    WARNING: Missing coordinates for {from_fac} or {to_fac}")
+                path_steps.append({
+                    'scenario_id': scenario_id,
+                    'origin': od_row['origin'],
+                    'dest': od_row['dest'],
+                    'step_order': i + 1,
+                    'from_facility': from_fac,
+                    'to_facility': to_fac,
+                    'distance_miles': 0.0,
+                    'drive_hours': 0.0,
+                    'processing_hours_at_destination': hours_per_touch
+                })
+
+    return pd.DataFrame(path_steps)
 
 
 def _fix_od_fill_rates_from_lanes(od_selected: pd.DataFrame, arc_summary: pd.DataFrame) -> pd.DataFrame:
@@ -146,7 +281,7 @@ def _run_one_strategy(
         out_dir: Path,
 ):
     """
-    EXTENDED: Execute network optimization with integrated sort level optimization.
+    Execute network optimization with integrated sort level optimization.
     """
 
     scenario_id_from_input = scenario_row.get("scenario_id",
@@ -214,7 +349,7 @@ def _run_one_strategy(
 
     print(f"  Paths prepared for extended MILP optimization with sort level decisions")
 
-    # EXTENDED: Use the new MILP solver with sort optimization
+    # Run MILP solver with sort optimization
     print(f"  Running extended MILP optimization with multi-level sort decisions...")
     od_selected, arc_summary, network_kpis, sort_summary = solve_arc_pooled_path_selection_with_sort_optimization(
         paths, facilities, mb, pkgmix, cont, costs_local, timing_local
@@ -248,7 +383,7 @@ def _run_one_strategy(
     od_out = build_od_selected_outputs(od_selected, facilities, direct_day, mb)
     dwell_hotspots = build_dwell_hotspots(od_selected)
 
-    # Facility analysis - UPDATED: Pass container parameters for metrics
+    # Facility analysis - Pass container parameters for metrics
     facility_rollup = _identify_volume_types_with_costs(
         od_selected, pd.DataFrame(), direct_day, arc_summary,
         pkgmix, cont, strategy
@@ -267,26 +402,9 @@ def _run_one_strategy(
     if not validation_results.get('cost_consistency', True):
         print(f"  Warning: Cost aggregation inconsistency detected")
 
-    # Generate path steps for output
-    path_steps = []
-    for _, od_row in od_selected.iterrows():
-        path_str = str(od_row.get('path_str', f"{od_row['origin']}->{od_row['dest']}"))
-        nodes = path_str.split('->')
+    # Generate path steps for output with ACTUAL calculated values (no hardcoding)
+    path_steps_df = _generate_path_steps_from_od(od_selected, facilities, mb, timing_local, scenario_id)
 
-        for i, (from_fac, to_fac) in enumerate(zip(nodes[:-1], nodes[1:])):
-            path_steps.append({
-                'scenario_id': scenario_id,
-                'origin': od_row['origin'],
-                'dest': od_row['dest'],
-                'step_order': i + 1,
-                'from_facility': from_fac.strip(),
-                'to_facility': to_fac.strip(),
-                'distance_miles': 500,  # Default
-                'drive_hours': 8,  # Default
-                'processing_hours_at_destination': 2
-            })
-
-    path_steps_df = pd.DataFrame(path_steps)
     lane_summary = build_lane_summary(arc_summary)
 
     # Calculate KPIs
@@ -294,7 +412,7 @@ def _run_one_strategy(
     total_pkgs = od_selected["pkgs_day"].sum()
     cost_per_pkg = total_cost / max(total_pkgs, 1)
 
-    # EXTENDED: Include sort optimization metrics in KPIs
+    # Include sort optimization metrics in KPIs
     kpis = pd.Series({
         "total_cost": total_cost,
         "cost_per_pkg": cost_per_pkg,
@@ -311,7 +429,7 @@ def _run_one_strategy(
                             "path_type"] == "2_touch").mean() * 100 if "path_type" in od_selected.columns else 0,
         "pct_3_touch": (od_selected[
                             "path_type"] == "3_touch").mean() * 100 if "path_type" in od_selected.columns else 0,
-        # EXTENDED: Sort level distribution
+        # Sort level distribution
         "pct_region_sort": network_kpis.get('pct_region_sort', 0),
         "pct_market_sort": network_kpis.get('pct_market_sort', 0),
         "pct_sort_group_sort": network_kpis.get('pct_sort_group_sort', 0),
@@ -339,7 +457,7 @@ def _run_one_strategy(
         'key': 'total_sort_savings', 'value': kpis['total_sort_savings']
     }])
 
-    # EXTENDED: Use enhanced write function with sort summary
+    # Write with facilities and timing for sort capacity calculation
     write_success = write_workbook_with_sort_analysis(
         out_path,
         scenario_summary,
@@ -349,7 +467,9 @@ def _run_one_strategy(
         facility_rollup,
         arc_summary,
         kpis,
-        sort_summary  # NEW: Include sort analysis
+        sort_summary,
+        facilities=facilities,  # NEW: Pass for sort capacity
+        timing_kv=timing_local  # NEW: Pass for sort capacity
     )
 
     if not write_success:
@@ -376,7 +496,7 @@ def main(input_path: str, output_dir: str):
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
 
-    print(f"🚀 Starting EXTENDED Network Optimization with Multi-Level Sort Optimization")
+    print(f"🚀 Starting Network Optimization with Multi-Level Sort Optimization")
     print(f"📁 Input: {input_path.name}")
     print(f"📁 Output: {output_dir}")
     print(f"🔧 Integrated path selection + sort level optimization in single MILP")
@@ -390,7 +510,7 @@ def main(input_path: str, output_dir: str):
 
     base_id = input_path.stem.replace("_input", "").replace("_v4", "")
 
-    # Run with container strategy only (no longer testing fluid vs container)
+    # Run with container strategy only
     strategies = ["container"]
     compare_results = []
     created_files = []
@@ -457,7 +577,7 @@ def main(input_path: str, output_dir: str):
             created_files.append(exec_summary_path.name)
             print(f"  ✓ Created executive summary: {exec_summary_path.name}")
 
-    print("\n🎉 EXTENDED Network Optimization Complete!")
+    print("\n🎉 Network Optimization Complete!")
 
     if created_files:
         print(f"📋 Created {len(created_files)} files with multi-level sort analysis:")
