@@ -1,13 +1,56 @@
-# veho_net/reporting.py - Fixed zone and cost calculations
+# veho_net/reporting.py - UPDATED: Add container metrics for injection and intermediate volumes
 import pandas as pd
 import numpy as np
 from .geo import haversine_miles
 
 
+def _calculate_containers_needed(pkgs_day: float, package_mix: pd.DataFrame,
+                                 container_params: pd.DataFrame, strategy: str) -> dict:
+    """
+    Calculate container requirements for a given package volume.
+
+    Returns:
+        Dict with container counts and cube metrics
+    """
+    from .time_cost import weighted_pkg_cube
+
+    w_cube = weighted_pkg_cube(package_mix)
+    total_cube = pkgs_day * w_cube
+
+    if strategy.lower() == "container":
+        gaylord_row = container_params[container_params["container_type"].str.lower() == "gaylord"].iloc[0]
+        raw_container_cube = float(gaylord_row["usable_cube_cuft"])
+        pack_util_container = float(gaylord_row["pack_utilization_container"])
+        effective_container_cube = raw_container_cube * pack_util_container
+
+        # Calculate containers needed
+        exact_containers = total_cube / effective_container_cube
+        physical_containers = max(1, int(np.ceil(exact_containers)))
+
+        container_fill_rate = min(1.0, total_cube / (physical_containers * raw_container_cube))
+
+        return {
+            'physical_containers': physical_containers,
+            'total_cube_cuft': total_cube,
+            'container_fill_rate': container_fill_rate
+        }
+    else:
+        # Fluid strategy - no containers
+        return {
+            'physical_containers': 0,
+            'total_cube_cuft': total_cube,
+            'container_fill_rate': 0.0
+        }
+
+
 def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_selected: pd.DataFrame,
-                                      direct_day: pd.DataFrame, arc_summary: pd.DataFrame) -> pd.DataFrame:
+                                      direct_day: pd.DataFrame, arc_summary: pd.DataFrame,
+                                      package_mix: pd.DataFrame = None,
+                                      container_params: pd.DataFrame = None,
+                                      strategy: str = "container") -> pd.DataFrame:
     """
     Calculate facility volume and cost breakdowns by role type.
+    UPDATED: Add container metrics for injection and intermediate volumes.
 
     Each facility shows costs for packages that ORIGINATE there,
     including the full cost chain through to final delivery.
@@ -29,6 +72,8 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
             # Injection role: facility as origin - show FULL cost chain for originating packages
             injection_pkgs = 0
             total_injection_cost = 0  # Full cost chain for packages originating here
+            injection_containers = 0
+            injection_cube = 0.0
 
             if not od_selected.empty:
                 outbound_ods = od_selected[od_selected['origin'] == facility]
@@ -37,9 +82,19 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
                     # Full cost for packages originating at this facility
                     total_injection_cost = outbound_ods['total_cost'].sum()
 
+                    # UPDATED: Calculate injection containers
+                    if package_mix is not None and container_params is not None:
+                        container_calc = _calculate_containers_needed(
+                            injection_pkgs, package_mix, container_params, strategy
+                        )
+                        injection_containers = container_calc['physical_containers']
+                        injection_cube = container_calc['total_cube_cuft']
+
             # Intermediate role: packages passing through (NOT originating here)
             intermediate_pkgs = 0
             intermediate_processing_cost = 0
+            intermediate_containers = 0
+            intermediate_cube = 0.0
 
             if not arc_summary.empty:
                 # Packages arriving for processing (excluding packages that originated here)
@@ -50,6 +105,14 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
                     # Intermediate packages = inbound packages not originating at this facility
                     intermediate_pkgs = inbound_pkgs - injection_pkgs
                     intermediate_pkgs = max(0, intermediate_pkgs)
+
+                    # UPDATED: Calculate intermediate containers
+                    if intermediate_pkgs > 0 and package_mix is not None and container_params is not None:
+                        container_calc = _calculate_containers_needed(
+                            intermediate_pkgs, package_mix, container_params, strategy
+                        )
+                        intermediate_containers = container_calc['physical_containers']
+                        intermediate_cube = container_calc['total_cube_cuft']
 
                     # Processing cost for intermediate packages only
                     if intermediate_pkgs > 0:
@@ -77,13 +140,18 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
             # Calculate unit costs for packages ORIGINATING at this facility
             injection_cost_per_pkg = (total_injection_cost / injection_pkgs) if injection_pkgs > 0 else 0
             intermediate_cost_per_pkg = (
-                        intermediate_processing_cost / intermediate_pkgs) if intermediate_pkgs > 0 else 0
+                    intermediate_processing_cost / intermediate_pkgs) if intermediate_pkgs > 0 else 0
 
             volume_entry = {
                 'facility': facility,
                 'injection_pkgs_day': injection_pkgs,
                 'intermediate_pkgs_day': intermediate_pkgs,
                 'last_mile_pkgs_day': last_mile_pkgs,
+                # UPDATED: Container metrics
+                'injection_containers': injection_containers,
+                'injection_cube_cuft': injection_cube,
+                'intermediate_containers': intermediate_containers,
+                'intermediate_cube_cuft': intermediate_cube,
                 # For injection: show full cost chain for originating packages
                 'injection_total_cost': total_injection_cost,
                 'injection_cost_per_pkg': injection_cost_per_pkg,
@@ -114,6 +182,10 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
                 'injection_pkgs_day': 0,
                 'intermediate_pkgs_day': 0,
                 'last_mile_pkgs_day': 0,
+                'injection_containers': 0,
+                'injection_cube_cuft': 0.0,
+                'intermediate_containers': 0,
+                'intermediate_cube_cuft': 0.0,
                 'injection_total_cost': 0,
                 'injection_cost_per_pkg': 0,
                 'intermediate_processing_cost': 0,

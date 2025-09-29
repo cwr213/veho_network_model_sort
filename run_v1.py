@@ -1,4 +1,4 @@
-# run_v1.py - EXTENDED: Multi-level sort optimization integrated with network optimization
+# run_v1.py - UPDATED: Pass container parameters to reporting functions for container metrics
 import argparse
 from pathlib import Path
 import pandas as pd
@@ -248,9 +248,10 @@ def _run_one_strategy(
     od_out = build_od_selected_outputs(od_selected, facilities, direct_day, mb)
     dwell_hotspots = build_dwell_hotspots(od_selected)
 
-    # Facility analysis
+    # Facility analysis - UPDATED: Pass container parameters for metrics
     facility_rollup = _identify_volume_types_with_costs(
-        od_selected, pd.DataFrame(), direct_day, arc_summary
+        od_selected, pd.DataFrame(), direct_day, arc_summary,
+        pkgmix, cont, strategy
     )
     facility_rollup = _calculate_hourly_throughput_with_costs(
         facility_rollup, timing_local, strategy
